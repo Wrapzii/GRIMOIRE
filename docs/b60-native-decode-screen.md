@@ -56,7 +56,7 @@ dispatch counts, not GPU durations. Keep oneDNN on for the decode baseline.
 | BF16 BAR peer rendezvous | **10,112 → 2,560 waits per rank** (−74.7%), at the same 2,560 reductions and with exact committed IDs. Decode elapsed **1,004.54 → 995.23 ms** (−0.93%) in one off-first pair. | Worth preserving as an opt-in experiment. Test slower interconnects independently; no established throughput gain there or reason to change the default. |
 | All-visible verify tiles | Exact numerical/ID checks passed; native decode was **+4.00% / +0.15% elapsed** in the two orders. | Park this shortcut. It does not rule out a better attention or verifier kernel. |
 | Device-only draft attention graph | Captured the device producer before the first host-visible reduction; native decode was **−0.94% / +0.07% elapsed**. | Park this partial graph. It did not remove the whole draft's host dependencies. |
-| Gathered 65K draft vocabulary | Smaller head was ~72% cheaper per proposal on the host completion clock. Hybrid decode was **10.75–11.09% faster on prose**, **16.35–18.03% faster on code**, but **90.00–91.33% slower on multilingual**; exact IDs in all 24 paired comparisons. | Do not promote the hybrid. Acceptance, not just head time, determines cost per commit. |
+| Gathered 65K draft vocabulary | Smaller head was ~72% cheaper per proposal on the host completion clock. Hybrid decode elapsed was **−10.75% / −11.09% on prose**, **−16.35% / −18.03% on code**, but **+90.00% / +91.33% on multilingual**; exact IDs in all 24 paired comparisons. | Do not promote the hybrid. Acceptance, not just head time, determines cost per commit. |
 | Adaptive hybrid draft head | A predeclared 15 ms/commit budget over four complete hybrid rounds sent multilingual back to full at round 5 and warmed prose at round 9. Code never switched. Decode elapsed was **−2.22% / −2.78%** on prose, **−16.52% / −16.85%** on code, and **−0.46% / −0.59%** on multilingual, all vs. that binary's full head. Exact IDs matched. | Mitigated this multilingual regression; near-neutral there, with the hybrid's 167.5 MiB per-rank allocation still resident. An opt-in screen, not a general policy or default. |
 | Packed INT8 K / INT4 V | At a matched 16K retrieval point, target KV allocation was **275,025,920 → 209,442,816 bytes per rank** (−23.85%). The packed arm had **+18.4–18.7% prefill elapsed** and **+5.3–5.5% decode elapsed**. | Capacity lead, not a speed win. Qualify retrieval, rollback and usable context separately from throughput. |
 
@@ -103,11 +103,28 @@ claim; don't tune membership or thresholds on these three results.
   attention cost, target FFN/GDN producer completion, and BAR publication as
   separate measurements. A benchmark across repositories with several switches
   applied together is useful provenance, not attribution to one kernel.
-- **INT8 K / INT4 V:** the 16K test compared INT8 K with FP8 V against INT8 K
-  with packed affine INT4 V, retaining FP8 V for the drafter. Both arms passed
-  a three-location retrieval check; it was one slot and one operating point,
-  not maximum usable context. First improve the packed-V read/dequant work in
-  the real target attention kernel without overriding append/rollback checks.
-  Then qualify longer contexts and independent slot histories, report actual
-  resident and allocated bytes, and keep retrieval quality and decode time
-  separate. Do not infer usable capacity from an allocator calculation alone.
+### Packed V4 at 16K: less target KV, slower at this operating point
+
+Both arms used INT8 K, with only target V switching between FP8 and packed
+scalar affine INT4; the drafter retained FP8 V. Context capacity was 16,528
+with one slot, 16,384 input IDs and 128 exact output commits. Each fresh load
+had one discarded warmup and three measured requests. Here are the block
+medians in actual run order:
+
+| Block | Target V | Prefill r0, s | Input tok/s | Decode, s | Output tok/s |
+|---|---|---:|---:|---:|---:|
+| 0 | FP8 | 20.708186 | 791.18 | 1.408032 | 90.197 |
+| 1 | INT4 | 24.580613 | 666.54 | 1.484708 | 85.539 |
+| 2 | INT4 | 24.585128 | 666.42 | 1.488070 | 85.345 |
+| 3 | FP8 | 20.760738 | 789.18 | 1.413092 | 89.874 |
+
+[All 12 measured rows](benchmarks/b60-native-v11010/packed-v4-16k.native-rows.csv)
+include both rank prefill clocks, first-commit latency, draft counters and
+retrieval flags. All requests recovered the three markers in order and had
+the same 128 committed IDs. Draft work changed (FP8: 101 accepted / 162
+judged; INT4: 102 / 156), so native decode does not isolate the attention
+reader. The target KV allocation change is **−65,583,104 bytes per rank**
+(−23.85%); that is not the change in whole-engine residency or evidence of
+maximum usable context. Improve the read/dequant path at fixed cache layout
+first. Qualify longer contexts, rollback and independent slot histories
+separately before claiming a capacity or serving gain.
