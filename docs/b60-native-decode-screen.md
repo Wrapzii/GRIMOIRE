@@ -18,10 +18,35 @@ prompt prefill. Decode is first commit to both ranks drained (127 subsequent
 commits). Neither is a GPU-event span or HTTP delivery time. Do not sum the two
 ranks or add nested timings to their parent spans.
 
-For one counting control, oneDNN moved outer prefill from **3.875 to 3.269 s**
-(15.6% lower), with the expected GEMM dispatch and exact output parity. Decode
-was **126.49 to 127.55 tok/s**, too small a change to attribute confidently to
-prefill. Keep oneDNN prefill as the decode baseline, not as a decode tuning knob.
+## oneDNN: 2,114 → 2,506 input tok/s (+18.54%)
+
+On the same warmed native counting workload, enabling oneDNN saved **0.606 s**
+of prompt prefill: **3.875262 → 3.269224 s (−15.64%)** on rank 0. Prefill
+throughput is `8192 / prompt_prefill_seconds`, not `8192 / time_to_first_token`
+and not the sum of two TP ranks. All 128 ordered output IDs matched on both
+ranks, including the excluded warmup. The decode result was **126.49 → 127.55
+output tok/s** (127 tokens after first commit). This one off-first pair does
+not establish a decode speedup or generalize to other prompts.
+
+| oneDNN / rep | Prefill r0, ms | Prefill r1, ms | Input tok/s r0 | First commit, ms | Decode, ms | Output tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| Off 1 | 3873.801 | 3873.801 | 2114.72 | 3874.617 | 1004.048 | 126.488 |
+| Off 2 | 3875.262 | 3875.273 | 2113.92 | 3875.951 | 1003.593 | 126.545 |
+| Off 3 | 3878.294 | 3878.346 | 2112.27 | 3878.959 | 1008.870 | 125.883 |
+| On 1 | 3269.224 | 3269.197 | 2505.79 | 3269.952 | 995.729 | 127.545 |
+| On 2 | 3275.551 | 3275.513 | 2500.95 | 3276.198 | 996.720 | 127.418 |
+| On 3 | 3269.189 | 3269.168 | 2505.82 | 3269.838 | 988.491 | 128.479 |
+
+Both arms issued one 8,192-row prompt call per rank. Warmup dispatch receipts
+show 1,024 BF16 VNNI fallback `gemm_predq` calls per rank with oneDNN off;
+with it on, that counter went to zero and the logs show 512 fused rotated-INT8
+oneDNN + SwiGLU calls and 384 ordinary oneDNN calls per rank. These are host
+dispatch counts, not GPU durations. Keep oneDNN on for the decode baseline.
+
+[Evidence and reproduction](benchmarks/b60-native-v11010/README.md) ·
+[All 12 measured rows with unrounded clocks](benchmarks/b60-native-v11010/native-measurements.csv) ·
+[oneDNN off](benchmarks/b60-native-v11010/onednn-0.verified.json) /
+[on](benchmarks/b60-native-v11010/onednn-1.verified.json)
 
 ## Where to spend the next measurement window
 
@@ -44,8 +69,11 @@ neither bytes transferred nor the number or arithmetic of reductions. Host
 publication/peer wait/flush declined by about **10.7 ms** on rank 0. Most of
 the remaining nested reduction time was in the wait for the producer, which
 also includes already queued GPU work. It is not evidence that the fabric was
-saturated. The paired prefill clocks drifted **+3.51%**, even though the change
-was in verify, so the ordered decode pair is not a repeatability result.
+saturated. The paired prefill clocks drifted **3.247 → 3.361 s** (+3.51%, **2,523 →
+2,437 input tok/s**), even though the change was in verify. This ordered pair
+is not a repeatability result. [All rank spans, including warmup](benchmarks/b60-native-v11010/rendezvous-rank-spans.csv)
+show the counts and elapsed ns per request; these are host spans, not GPU
+kernel times.
 
 For PCIe with fewer lanes, OCuLink, or another topology, first record the actual
 link and verify that this BF16 BAR path dispatches. Counterbalance same-binary
