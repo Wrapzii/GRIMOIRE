@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "b70/inkling2_expert.hpp"
 #include "b70/safetensors.hpp"
 
 #include <cstddef>
@@ -38,7 +39,6 @@ struct Config {
 // Initial port supports fixed-pass text, not variable loops, vision, or MTP.
 Config parse_config(std::string_view json);
 using TensorMap=std::map<std::string,STTensor>;
-enum class PackedFormat { NVFP4, MXFP8 };
 struct LayerLayout {
     PackedFormat gate_up, down;
 };
@@ -67,8 +67,10 @@ float swiglu(float gate,float up,float gate_cap,float up_cap);
 struct Checkpoint {
     Config config;
     std::vector<LayerLayout> layout;
-    std::shared_ptr<SafeTensors> file;
+    std::shared_ptr<const SafeTensors> file;
     static Checkpoint open(const std::string& dir);
+    // Exposes exactly one expert's source bytes; valid while the shard is mapped.
+    ExpertMatrix expert_matrix(int layer, int expert, bool down) const;
 };
 
 // Slow native text oracle for parity work. One sequence, contiguous token IDs,

@@ -258,12 +258,35 @@ Checkpoint Checkpoint::open(const std::string& dir) {
     c.config=parse_config(config);
     // The original release and requested fine-tune use this target shard;
     // do not enumerate the separate MTP shard as model weights.
-    c.file=std::make_shared<SafeTensors>();
+    auto file=std::make_shared<SafeTensors>();
     std::string err;
     const auto path=(std::filesystem::path(dir)/"model-00001-of-00001.safetensors").string();
-    if(!c.file->open(path,err)) throw std::runtime_error(err);
-    c.layout=validate_tensors(c.config,c.file->tensors());
+    if(!file->open(path,err)) throw std::runtime_error(err);
+    c.layout=validate_tensors(c.config,file->tensors());
+    c.file=std::move(file);
     return c;
+}
+
+ExpertMatrix Checkpoint::expert_matrix(int layer, int expert, bool down) const {
+    expect(file && layer>=0 && layer<config.layers && size_t(layer)<layout.size() &&
+           expert>=0 && expert<config.experts,"expert matrix index out of range");
+    const std::string key="model.llm.layers."+std::to_string(layer)+".mlp.experts."+(down?"w2_weight":"w13_weight");
+    auto data=[&](const std::string& suffix) {
+        return static_cast<const uint8_t*>(file->data(tensor(file->tensors(),key+suffix)));
+    };
+    const auto fmt=down?layout[layer].down:layout[layer].gate_up;
+    const int n=down?config.hidden:2*config.inter, k=down?config.inter:config.hidden;
+    float outer=1.f;
+    if(fmt==PackedFormat::NVFP4) {
+        float amax, denom;
+        std::memcpy(&amax,data("_amax")+size_t(expert)*4,4);
+        std::memcpy(&denom,data("_outer_scale_denominator"),4);
+        expect(std::isfinite(amax) && amax>=0 && std::isfinite(denom) && denom>0,"invalid NVFP4 outer scale");
+        outer=amax/denom;
+        expect(std::isfinite(outer),"NVFP4 outer scale overflows");
+    }
+    const size_t row=size_t(expert)*n;
+    return {fmt,n,k,data("")+row*payload_row_bytes(fmt,k),data("_scale")+row*scale_row_bytes(fmt,k),outer};
 }
 
 } // namespace b70::inkling2

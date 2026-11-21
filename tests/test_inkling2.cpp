@@ -13,6 +13,36 @@
 
 using namespace b70::inkling2;
 
+// The device packer's arithmetic is also ordinary C++. Compare every input
+// weight against the independent scalar checkpoint reader at the Mini shapes.
+template<PackedFormat F>
+static void check_pair_layout(int n,int k) {
+    constexpr bool nv=F==PackedFormat::NVFP4;
+    const int pb=nv?k/2:k, sb=nv?k/16:k/32;
+    std::vector<uint8_t> payload(size_t(n)*pb), scales(size_t(n)*sb);
+    for(size_t i=0;i<payload.size();++i) {
+        const uint8_t code=uint8_t(i*73+(i/pb)*29+i/13);
+        payload[i]=!nv && (code&127)==127?uint8_t(code-1):code;
+    }
+    for(size_t i=0;i<scales.size();++i)
+        scales[i]=uint8_t((nv?39:120)+(i*19+i/sb)%13);
+    const float amax=2.7f, denom=3.1f;
+    const ExpertMatrix matrix{F,n,k,payload.data(),scales.data(),nv?amax/denom:1.f};
+    const PackedRows oracle{F,1,n,k,payload.data(),scales.data(),&amax,denom};
+    std::vector<uint16_t> packed(size_t(n)*k);
+    for(int kp=0;kp<k/2;++kp) for(int col=0;col<n;++col) {
+        const auto dword=expert_bf16_pair<F>(matrix,col,kp);
+        const auto at=2*vnni_pair_index(n,col,kp);
+        packed[at]=uint16_t(dword); packed[at+1]=uint16_t(dword>>16);
+    }
+    std::vector<float> row(k);
+    for(int col=0;col<n;++col) {
+        oracle.row(0,col,row);
+        for(int j=0;j<k;++j)
+            assert(packed[size_t(j/2)*n*2+2*col+j%2]==b70::f32_to_bf16(row[j]).bits);
+    }
+}
+
 int main(int argc,char** argv) {
     const auto check_bad=[](auto fn){
         try { fn(); }
@@ -68,8 +98,24 @@ int main(int argc,char** argv) {
     assert(one.at("x").shape==std::vector<int64_t>{1});
     check_bad([]{read_tensor_header(R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[0,3]}})");});
     check_bad([]{read_tensor_header(R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}})");});
+    for(int k:{2304,1152}) {
+        check_pair_layout<PackedFormat::NVFP4>(2304,k);
+        check_pair_layout<PackedFormat::MXFP8>(2304,k);
+    }
     if(argc>=3) {
         auto c=Checkpoint::open(argv[2]);
+        for(int layer:{0,c.config.layers-1}) for(bool down:{false,true}) {
+            const auto a=c.expert_matrix(layer,0,down), b=c.expert_matrix(layer,1,down);
+            const bool nv=layer==0;
+            assert((a.format==PackedFormat::NVFP4)==nv && a.format==b.format);
+            assert(a.n==(down?c.config.hidden:2*c.config.inter));
+            assert(a.k==(down?c.config.inter:c.config.hidden));
+            assert(b.payload-a.payload==a.n*(nv?a.k/2:a.k));
+            assert(b.scales-a.scales==a.n*(nv?a.k/16:a.k/32));
+            assert(a.outer==(nv?.5f:1.f) && b.outer==1.f);
+        }
+        check_bad([&]{c.expert_matrix(-1,0,false);});
+        check_bad([&]{c.expert_matrix(0,c.config.experts,true);});
         TextReference model(std::move(c),16);
         std::vector<float> first(model.config().output_vocab), after(first.size());
         const int id=model.step(2,first);
@@ -81,5 +127,5 @@ int main(int argc,char** argv) {
         const int again=model.step(2,after);
         assert(model.position()==1 && id==again && first==after);
     }
-    std::cout<<"PASS Inkling2 loop/cache schedule, packed weights, routing, SwiGLU, reset and malformed header rejection\n";
+    std::cout<<"PASS Inkling2 schedule, expert views, Mini-shape VNNI layout, routing, SwiGLU, reset and malformed header rejection\n";
 }
